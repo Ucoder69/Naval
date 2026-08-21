@@ -17,11 +17,7 @@ recv_pool = ThreadPoolExecutor(max_workers=max(1, os.cpu_count()//2))
 conn_alive = True
 TUNER = Tuner()
 recv_ready = threading.Event()
-probe_event = threading.Event()
 ready_event = threading.Event()
-probe_sent_time = None
-probe_rtt = None
-CURRENT_SESSION = 0
 send_queue = Queue(maxsize=64)
 
 # ── Socket lock — prevents two threads writing simultaneously ─────────────────
@@ -39,23 +35,49 @@ def send_frame(conn, msg_type, payload: bytes):
     with _send_lock:
         conn.sendall(header)
         conn.sendall(payload)
+def handshake_auth(conn) -> tuple[bytes, str]:
+    """Exchanges public keys, tests mutual key validity via encrypted handshake,
 
-def auto_tune(conn):
-    global probe_sent_time, probe_rtt
-    probe_event.clear()
-    probe_sent_time = time.time()
-    send_system(conn, "PING")
-    if not probe_event.wait(timeout=2.0):
-        return {"mode": "Balanced-"}
-    rtt_ms = probe_rtt * 1000  # type: ignore
-    print(f"PING: {int(rtt_ms)} ms")
-    if rtt_ms <= 3:
-        TUNER.apply_mode("turbo+")
-    elif rtt_ms <= 6:
-        TUNER.apply_mode("turbo")
-    else:
-        TUNER.apply_mode("balanced")
-    send_queue.maxsize = TUNER.queue_size
+    and returns (shared_key, safety_code) or raises an exception to abort.
+    """
+    my_sk, my_pk = en.generate_keypair()
+    my_pk_bytes = my_pk.encode()
+
+    # 1. Send public key
+    send_system(conn, f"PUBKEY:{my_pk_bytes.hex()}")
+
+    # 2. Read peer public key
+    peer_pk_bytes = None
+    while not peer_pk_bytes:
+        header = transport.read_exactly(conn, 5)
+        l = protocol.d_length(header[1:5])
+        payload = transport.read_exactly(conn, l).decode("utf-8")
+
+        if payload.startswith("PUBKEY:"):
+            peer_pk_bytes = bytes.fromhex(payload.split(":", 1)[1])
+
+    # 3. Derive key and safety number
+    shared_key = en.derive_shared_key(my_sk, peer_pk_bytes)
+    safety_code = en.generate_safety_number(my_pk_bytes, peer_pk_bytes)
+
+    # 4. Exchange encrypted AUTH tokens to test key integrity
+    auth_token = b"VERIFY_KEY_INTEGRITY_OK"
+
+    # Send encrypted ping
+    encrypted_ping = en.encrypt_msg(shared_key, auth_token)
+    send_frame(conn, "Text", encrypted_ping)
+
+    # Receive peer encrypted ping
+    header = transport.read_exactly(conn, 5)
+    l = protocol.d_length(header[1:5])
+    peer_payload = transport.read_exactly(conn, l)
+
+    # 5. Validate decryption and payload match
+    decrypted_token = en.decrypt_msg(shared_key, peer_payload)
+    if decrypted_token != auth_token:
+        raise ValueError("Handshake token mismatch!")
+
+    return shared_key, safety_code
 
 def send_file(conn, key: bytes, path: str):
     TUNER.begin_transfer()
@@ -64,9 +86,9 @@ def send_file(conn, key: bytes, path: str):
     filename = os.path.basename(path)
     total_size = os.path.getsize(path)
     sent = 0
-    max_inflight = 10  # chunks being encrypted in parallel at once
+    max_inflight = max(1, os.cpu_count()//2+1)  # chunks being encrypted in parallel at once
 
-    send_frame(conn, "File", f"META:{session}:{filename}".encode("utf-8"))
+    send_frame(conn, "File", f"META:{session}:{filename}:{total_size}".encode("utf-8"))
 
     pending = deque()  # holds Futures in submission order
 
@@ -148,7 +170,8 @@ def file_worker_thread(key: bytes):
         
         if action == "META":
             meta = payload.decode("utf-8")
-            _, _, current_file = meta.split(":", 2)
+            _, _, current_file,total_bytes = meta.split(":", 3)
+            total_bytes=int(total_bytes )
             path = os.path.join("received_files", current_file)
             file_handle = open(path, "wb")
             received_bytes = 0
@@ -157,11 +180,11 @@ def file_worker_thread(key: bytes):
         elif action == "CHUNK":
             if file_handle:
                 decrypted_chunk = payload.result() 
-                
                 file_handle.write(decrypted_chunk)
                 sha.update(decrypted_chunk)
                 received_bytes += len(decrypted_chunk)
-                print(f"\rReceived {received_bytes/(1024*1024):.1f} MB", end='')
+                pct = (received_bytes / total_bytes) * 100 if total_bytes else 0
+                print(f"\rReceived {received_bytes/(1024*1024):.1f}/{total_bytes/(1024*1024):.1f} MB ({pct:.1f}%)", end='')
                 
         elif action == "END":
             local_hash = sha.hexdigest()
@@ -170,6 +193,8 @@ def file_worker_thread(key: bytes):
                 print(f"\nFile received: {current_file}")
                 
         elif action == "HASH":
+            if isinstance(payload, bytes):
+                payload = payload.decode("utf-8")
             sender_hash = payload.split(":", 1)[1]
             if local_hash and sender_hash == local_hash:
                 print("-> File Verified")
@@ -182,11 +207,19 @@ def file_worker_thread(key: bytes):
 def run_chat(conn, username):
     global conn_alive
     os.makedirs("received_files", exist_ok=True)
-    password = input("Enter shared password: ")
-    key = en.derive_key(password)
-    cipher = en.XChaCha20Cipher(key) 
-    send_system(conn, f"JOIN:{username}")
 
+    print("[*] Exchanging public keys & authenticating...")
+
+    # Auth Check - Aborts if untrusted or tampered
+    try:
+        key, safety_code = handshake_auth(conn)
+        print(f"[SECURE] Key Verified! Safety Code: {safety_code}")
+    except Exception as e:
+        print(f"\n[ABORTED] Security verification failed: {e}")
+        conn.close()
+        return
+    
+    send_system(conn, f"JOIN:{username}")
     t = threading.Thread(target=receiver_loop, args=(conn, key,), daemon=True)
     net_thread = threading.Thread(target=network_sender, args=(conn,), daemon=True)
     net_thread.start()
@@ -197,9 +230,8 @@ def run_chat(conn, username):
     if not ready_event.wait(timeout=8):
         print("[WARN] peer ready timeout") 
     recv_ready.wait(timeout=2)
-    auto_tune(conn)
-    set_mode(TUNER.mode)
-    print(f"[AutoTune] Mode: {TUNER.mode.title()} | Chunk: {TUNER.chunk_size//1024//1024}MB | Queue: {TUNER.queue_size}")
+    TUNER.auto_tune(conn, send_system, send_queue)
+    print(f"[AutoTune] {TUNER.status()}")
     sender_loop(conn, username, key)
 
 def receiver_loop(conn, key: bytes):
@@ -238,9 +270,7 @@ def receiver_loop(conn, key: bytes):
                 elif payload == "PING":                         # Pinging to new user for TUNER
                     send_system(conn, "PONG")
                 elif payload == "PONG":                         # returning ping to check timing
-                    global probe_rtt, probe_sent_time, probe_event
-                    probe_rtt = time.time() - probe_sent_time  # type: ignore
-                    probe_event.set()
+                    TUNER.handle_pong()
                     
                 # -- THE FIX: Send system file messages to the worker queue --
                 elif payload == "FILE_END":
@@ -293,8 +323,6 @@ def sender_loop(conn, username, key: bytes):
                 success, msg = TUNER.apply_mode(parts[1].lower())
                 if success:
                     set_mode(parts[1].title())
-                    global CURRENT_SESSION
-                    CURRENT_SESSION = TUNER.session_id
                 print(msg)
                 send_queue.maxsize = TUNER.queue_size
                 continue
