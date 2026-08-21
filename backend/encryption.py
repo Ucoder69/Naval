@@ -1,25 +1,32 @@
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import nacl.bindings
 import nacl.pwhash
 import nacl.utils
-
+import nacl.public
 # Fixed 16-byte application domain salt (No network salt exchange needed!)
-APP_SALT = b"Naval_LAN_App_v1"
+# APP_SALT = b"Naval_LAN_App_v1"
+
+def generate_keypair():
+    """Generates an ephemeral Curve25519 Private/Public keypair."""
+    sk = nacl.public.PrivateKey.generate()
+    return sk, sk.public_key
 
 
-def derive_key(password: str) -> bytes:
-    """Derives a 32-byte key using Argon2id.
+def derive_shared_key(
+    my_sk: nacl.public.PrivateKey, peer_pk_bytes: bytes
+) -> bytes:
+    """Derives the 32-byte shared symmetric key using ECDH."""
+    peer_pk = nacl.public.PublicKey(peer_pk_bytes)
+    return nacl.bindings.crypto_box_beforenm(peer_pk.encode(), my_sk.encode())
 
-    Takes ~50-100ms on mobile, blocking GPU/ASIC brute-force cracking.
-    """
-    return nacl.pwhash.argon2id.kdf(
-        size=32,
-        password=password.encode("utf-8"),
-        salt=APP_SALT,
-        opslimit=nacl.pwhash.argon2id.OPSLIMIT_MODERATE,
-        memlimit=nacl.pwhash.argon2id.MEMLIMIT_MODERATE,
-    )
 
+def generate_safety_number(my_pk_bytes: bytes, peer_pk_bytes: bytes) -> str:
+    """Generates a deterministic 6-digit WhatsApp-style safety number."""
+    combined = b"".join(sorted([bytes(my_pk_bytes), bytes(peer_pk_bytes)]))
+    digest = hashlib.sha256(combined).hexdigest()
+    safety_code = str(int(digest[:8], 16) % 1000000).zfill(6)
+    return f"{safety_code[:3]}-{safety_code[3:]}"
 
 class XChaCha20Cipher:
 
