@@ -23,9 +23,13 @@ def get_local_ip():
         return s.getsockname()[0]
     finally:
         s.close()
+
 def aport(ip, ports):
     s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
-    # s.setsockopt(socket.SOL_SOCKET, socket.SO_SENDBUF, 4*1024*1024) #TO-DO
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16*1024*1024) 
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16*1024*1024) 
+
     for port in ports:
         try:
             s.bind((ip, port))
@@ -42,11 +46,16 @@ def server(username):
     
     s.listen(1)
     print("Listening...")
-    zeroconf= start_mdns(username, ip, port)
+    zeroconf , info = start_mdns(username, ip, port)
 
     conn, addr =s.accept()
     print("connected from", addr)
-    run_chat(conn, username)
+    try:
+        run_chat(conn, username)
+    finally:
+        zeroconf.unregister_service(info)
+        zeroconf.close()
+        s.close()    
     
 if __name__ == "__main__":
     server()
