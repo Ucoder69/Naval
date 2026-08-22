@@ -1,14 +1,15 @@
-import hashlib
-import threading
+
 import backend.protocol as protocol
 import backend.transport as transport
+import backend.encryption as en
+from backend.tuning import Tuner
+from backend.config import set_mode
+import hashlib
+import threading
 import os
 import time
 from collections import deque
 from queue import Queue
-import backend.encryption as en
-from backend.tuning import Tuner
-from backend.config import set_mode
 from concurrent.futures import ThreadPoolExecutor
 
 # Create a pool to match the sender's max_inflight
@@ -79,22 +80,72 @@ def handshake_auth(conn) -> tuple[bytes, str]:
 
     return shared_key, safety_code
 
+def network_sender(conn):
+    while True:
+        item = send_queue.get()
+        if item is None:
+            break
+
+        # Check if item includes progress tracking metadata
+        if len(item) == 4:
+            msg_type, payload, raw_len, progress = item
+            send_frame(conn, msg_type, payload)
+            # Update counter AFTER actual network write succeeds
+            progress["sent"] += raw_len
+        else:
+            msg_type, payload = item
+            send_frame(conn, msg_type, payload)
+
+        send_queue.task_done()
+
+
 def send_file(conn, key: bytes, path: str):
     TUNER.begin_transfer()
     session = TUNER.session_id
     sha = hashlib.sha256()
     filename = os.path.basename(path)
     total_size = os.path.getsize(path)
-    sent = 0
-    max_inflight = max(1, os.cpu_count()//2+1)  # chunks being encrypted in parallel at once
 
-    send_frame(conn, "File", f"META:{session}:{filename}:{total_size}".encode("utf-8"))
+    # Shared progress dictionary updated by network_sender
+    progress = {"sent": 0}
+
+    max_inflight = max(1, os.cpu_count() // 2 + 1)
+
+    send_frame(
+        conn, "File", f"META:{session}:{filename}:{total_size}".encode("utf-8")
+    )
 
     pending = deque()  # holds Futures in submission order
 
+    start_time = time.time()
+    last_update = start_time
+
+    def print_progress():
+        nonlocal last_update
+        now = time.time()
+        if now - last_update >= 0.2:  # Update UI/terminal ~5 times per second
+            current_sent = progress["sent"]
+            elapsed = now - start_time
+            if current_sent > total_size:
+                current_sent = total_size
+
+            speed = current_sent / elapsed if elapsed > 0 else 0
+            remaining = total_size - current_sent
+            eta = remaining / speed if speed > 0 else 0
+            percent = (
+                (current_sent / total_size) * 100 if total_size > 0 else 100.0
+            )
+            speed_mb = speed / (1024 * 1024)
+            eta_min, eta_sec = int(eta // 60), int(eta % 60)
+
+            print(
+                f"\rSent {current_sent/(1024*1024):.1f}MB / {total_size/(1024*1024):.1f}MB "
+                f"({percent:.1f}%) | {speed_mb:.1f} MB/s | ETA {eta_min:02}:{eta_sec:02}",
+                end="",
+            )
+            last_update = now
+
     with open(path, "rb") as f:
-        start_time = time.time()
-        last_update = start_time
         eof = False
 
         while not eof or pending:
@@ -105,51 +156,37 @@ def send_file(conn, key: bytes, path: str):
                     eof = True
                     break
                 sha.update(chunk)
-                pending.append(en.parallel_encrypt(key, chunk))
+                # Store (future, raw_chunk_length)
+                pending.append((en.parallel_encrypt(key, chunk), len(chunk)))
 
             # ── Drain the oldest completed future into the send queue ─────────
             if pending:
-                encrypted = pending.popleft().result()  # blocks only if not ready
-                send_queue.put(("File", encrypted))
-                sent += TUNER.chunk_size  # approx, good enough for progress
+                future, raw_len = pending.popleft()
+                encrypted = future.result()  # blocks only if not ready
 
-                now = time.time()
-                elapsed = now - start_time
-                if sent > total_size:
-                    sent = total_size
-                if elapsed > 0 and now - last_update >= 1.0:
-                    speed = sent / elapsed
-                    remaining = total_size - sent
-                    eta = remaining / speed if speed > 0 else 0
-                    percent = (sent / total_size) * 100
-                    speed_mb = speed / (1024 * 1024)
-                    eta_min, eta_sec = int(eta // 60), int(eta % 60)
-                    print(
-                        f"\rSent {sent/(1024*1024):.1f}MB / {total_size/(1024*1024):.1f}MB "
-                        f"({percent:.1f}%) | {speed_mb:.1f} MB/s | ETA {eta_min:02}:{eta_sec:02}",
-                        end=""
-                    )
-                    last_update = now
+                # Push tuple with raw size and progress handle
+                send_queue.put(("File", encrypted, raw_len, progress))
 
-    # ── All chunks queued — wait for network_sender to flush them ─────────────
+                print_progress()
+
+    # ── Wait & print progress while network_sender flushes chunks over wire ──
+    while progress["sent"] < total_size:
+        print_progress()
+        time.sleep(0.05)
+
+    # Final guarantee queue is completely empty
     send_queue.join()
 
-    # ── Send FILE_END and FILE_HASH directly, queue is empty and flushed ──────
+    # Final 100% display update
+    print_progress()
+
+    # ── Send FILE_END and FILE_HASH directly ─────────────────────────────────
     send_system(conn, "FILE_END")
     send_system(conn, f"FILE_HASH:{sha.hexdigest()}")
 
     TUNER.end_transfer()
     print(f"\n[file sent: {filename}]")
-
-def network_sender(conn):
-    while True:
-        item = send_queue.get()
-        if item is None:
-            break
-        msg_type, payload = item
-        send_frame(conn, msg_type, payload)
-        send_queue.task_done()
-
+    
 # 1. Create a dedicated queue for the background file worker
 file_processing_queue = Queue(maxsize=128)
 
