@@ -40,11 +40,15 @@ def client(user):
     print("Searching for servers...")
     time.sleep(2)
     s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16*1024*1024) 
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16*1024*1024) 
+
     choice=input("Connect to (username) or press Enter for manual: \n").strip()
     if choice and choice in peers:
         ip, port=peers[choice]
     else:
-        ip=ip=get_local_ip()
+        ip=get_local_ip()
         port=int(input("PORT:"))
 
     s.connect((ip, port))
