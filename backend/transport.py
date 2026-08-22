@@ -1,14 +1,18 @@
 import socket
 
 def read_exactly(conn, n):
-    a=0
-    b=[]
-    while a<n:
-        remaining=n-a
-        data=conn.recv(min(65530, remaining))
-        if len(data)==0:
-            raise ConnectionError
-        a+=len(data)
-        b.append(data)
-    c=b"".join(b)
-    return c
+    # 1. Allocate the exact size once
+    buffer = bytearray(n)
+    view = memoryview(buffer)
+    
+    a = 0
+    while a < n:
+        # 3. recv_into grabs whatever the OS has ready (up to the remaining amount)
+        # No 64KB limit. If the OS has 2MB ready, it grabs 2MB in one microsecond.
+        chunk_size = conn.recv_into(view[a:], n - a)
+        if chunk_size == 0:
+            raise ConnectionError("Connection closed abruptly")
+        a += chunk_size
+        
+    # Convert to standard bytes for decryption
+    return buffer
