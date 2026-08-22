@@ -59,9 +59,9 @@ class Tuner:
             return
 
         rtt_ms = self.probe_rtt * 1000
-        self.apply_ping(rtt_ms)
+        self.apply_ping(int(rtt_ms))
 
-        if rtt_ms << 4 :
+        if rtt_ms < 4 :
             self.apply_mode("turbo+")
         elif rtt_ms <= 10:
             self.apply_mode("turbo")
