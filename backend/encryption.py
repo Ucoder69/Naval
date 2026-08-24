@@ -4,8 +4,7 @@ import nacl.bindings
 import nacl.pwhash
 import nacl.utils
 import nacl.public
-# Fixed 16-byte application domain salt (No network salt exchange needed!)
-# APP_SALT = b"Naval_LAN_App_v1"
+
 
 def generate_keypair():
     """Generates an ephemeral Curve25519 Private/Public keypair."""
@@ -66,7 +65,7 @@ class XChaCha20Cipher:
             )
             raise
 
-# Alias so your main app imports won't break if AESGCMCipher is referenced elsewhere
+# Alias for backward compatibility 
 AESGCMCipher = XChaCha20Cipher
 
 
